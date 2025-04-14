@@ -1,152 +1,114 @@
-using System;
-using System.Collections.Generic;
 using System.Data;
-using System.Linq;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using Microsoft.Data.SqlClient;
-using Microsoft.EntityFrameworkCore;
+using System.Data.SqlClient;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using SQLLLM.Data;
 
 namespace SQLLLM.Services
 {
-    public interface ISqlService
-    {
-        Task<(DataTable? Data, string? Error)> ExecuteSqlQueryAsync(string sqlQuery);
-        string GetDatabaseSchema();
-    }
-
+    /// <summary>
+    /// Implementation of ISqlService for SQL Server operations
+    /// </summary>
     public class SqlService : ISqlService
     {
-        private readonly ApplicationDbContext _dbContext;
+        private readonly string _connectionString;
         private readonly ILogger<SqlService> _logger;
 
-        public SqlService(ApplicationDbContext dbContext, ILogger<SqlService> logger)
+        public SqlService(IConfiguration configuration, ILogger<SqlService> logger)
         {
-            _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _connectionString = configuration.GetConnectionString("SqlDatabase") 
+                ?? throw new ArgumentNullException("SqlDatabase connection string is not configured");
+            _logger = logger;
         }
 
-        public async Task<(DataTable? Data, string? Error)> ExecuteSqlQueryAsync(string sqlQuery)
+        /// <inheritdoc/>
+        public async Task<(DataTable? ResultTable, string? ErrorMessage)> ExecuteSqlQueryAsync(string query)
         {
-            if (string.IsNullOrWhiteSpace(sqlQuery))
+            if (string.IsNullOrWhiteSpace(query))
             {
-                return (null, "SQL query is empty or null");
+                return (null, "Query cannot be empty");
             }
 
-            // Validate the SQL query for safety
-            var validationResult = ValidateSqlQuery(sqlQuery);
-            if (!validationResult.IsValid)
-            {
-                return (null, validationResult.Error);
-            }
+            var dataTable = new DataTable();
 
             try
             {
-                var dataTable = new DataTable();
-                
-                // Get connection from EF Core context
-                var connection = _dbContext.Database.GetDbConnection();
-                var wasClosed = connection.State == ConnectionState.Closed;
-                
-                if (wasClosed)
+                using (var connection = new SqlConnection(_connectionString))
                 {
                     await connection.OpenAsync();
-                }
-
-                try
-                {
-                    using var command = connection.CreateCommand();
-                    command.CommandText = sqlQuery;
-                    command.CommandType = CommandType.Text;
-                    
-                    using var reader = await command.ExecuteReaderAsync();
-                    dataTable.Load(reader);
-                    
-                    return (dataTable, null);
-                }
-                finally
-                {
-                    if (wasClosed)
+                    using (var command = new SqlCommand(query, connection))
                     {
-                        connection.Close();
+                        command.CommandTimeout = 60; // 1 minute timeout
+                        
+                        using (var reader = await command.ExecuteReaderAsync())
+                        {
+                            dataTable.Load(reader);
+                        }
                     }
                 }
+                
+                return (dataTable, null);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error executing SQL query: {Query}", sqlQuery);
+                _logger.LogError(ex, "Error executing SQL query: {Query}", query);
                 return (null, $"Error executing query: {ex.Message}");
             }
         }
 
+        /// <inheritdoc/>
         public string GetDatabaseSchema()
         {
-            // Return a string representation of the database schema
-            // This is a simple version focused on the Sales table for the demo
-            return @"
-CREATE TABLE Sales (
-    Id INT PRIMARY KEY IDENTITY,
-    Region NVARCHAR(100),
-    SaleDate DATE,
-    SalesAmount DECIMAL(18,2)
-);";
-        }
-
-        private (bool IsValid, string? Error) ValidateSqlQuery(string sqlQuery)
-        {
-            // Strip comments to prevent SQL injection through comments
-            sqlQuery = StripSqlComments(sqlQuery);
+            var schema = new System.Text.StringBuilder();
             
-            // Basic validation checks
-            if (ContainsDisallowedKeywords(sqlQuery))
+            try
             {
-                return (false, "Query contains disallowed keywords that might modify the database");
+                using (var connection = new SqlConnection(_connectionString))
+                {
+                    connection.Open();
+                    
+                    // Get all tables
+                    var tables = connection.GetSchema("Tables");
+                    foreach (DataRow tableRow in tables.Rows)
+                    {
+                        if (tableRow["TABLE_TYPE"].ToString() == "BASE TABLE")
+                        {
+                            var tableName = tableRow["TABLE_NAME"].ToString();
+                            schema.AppendLine($"Table: {tableName}");
+                            
+                            // Get columns for this table
+                            using (var command = new SqlCommand(
+                                $"SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE " +
+                                $"FROM INFORMATION_SCHEMA.COLUMNS " +
+                                $"WHERE TABLE_NAME = '{tableName}' " +
+                                $"ORDER BY ORDINAL_POSITION", connection))
+                            {
+                                using (var reader = command.ExecuteReader())
+                                {
+                                    while (reader.Read())
+                                    {
+                                        var columnName = reader["COLUMN_NAME"].ToString();
+                                        var dataType = reader["DATA_TYPE"].ToString();
+                                        var maxLength = reader["CHARACTER_MAXIMUM_LENGTH"];
+                                        var isNullable = reader["IS_NULLABLE"].ToString() == "YES" ? "NULL" : "NOT NULL";
+                                        
+                                        var lengthInfo = maxLength != DBNull.Value ? $"({maxLength})" : "";
+                                        schema.AppendLine($"  - {columnName} {dataType}{lengthInfo} {isNullable}");
+                                    }
+                                }
+                            }
+                            
+                            schema.AppendLine();
+                        }
+                    }
+                }
+                
+                return schema.ToString();
             }
-
-            // Only allow SELECT statements for safety
-            if (!IsSelectStatement(sqlQuery))
+            catch (Exception ex)
             {
-                return (false, "Only SELECT statements are allowed");
+                _logger.LogError(ex, "Error retrieving database schema");
+                return $"Error retrieving database schema: {ex.Message}";
             }
-
-            return (true, null);
-        }
-
-        private string StripSqlComments(string sql)
-        {
-            // Remove -- style comments
-            sql = Regex.Replace(sql, @"--(.*?)\r?\n", " ");
-            
-            // Remove /* */ style comments
-            sql = Regex.Replace(sql, @"/\*.*?\*/", " ", RegexOptions.Singleline);
-            
-            return sql;
-        }
-
-        private bool ContainsDisallowedKeywords(string sql)
-        {
-            // Convert to uppercase for case-insensitive matching
-            var upperSql = sql.ToUpperInvariant();
-            
-            // Disallow any data modification or schema change operations
-            var disallowedKeywords = new[] 
-            {
-                "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", 
-                "EXEC", "EXECUTE", "SP_", "XP_", "SYSTEM_", "GRANT", "REVOKE", "DENY"
-            };
-            
-            return disallowedKeywords.Any(keyword => upperSql.Contains(keyword));
-        }
-
-        private bool IsSelectStatement(string sql)
-        {
-            // Remove any leading whitespace
-            sql = sql.TrimStart();
-            
-            // Check if it starts with SELECT
-            return sql.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase);
         }
     }
 }
